@@ -1,0 +1,269 @@
+"""Repo fetch + in-memory index of CatWeb docs and templates."""
+from __future__ import annotations
+
+import io
+import os
+import re
+import json
+import time
+import shutil
+import tarfile
+import tempfile
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
+
+import httpx
+import yaml
+
+CACHE_TTL_SECONDS = 24 * 60 * 60  # 24h
+
+DEFAULT_DOCS_REPO = "Mailo037/catweb-docs"
+DEFAULT_RESOURCES_REPO = "Mailo037/catweb-additional-resources"
+
+
+def cache_root() -> Path:
+    base = os.environ.get("CATWEB_MCP_CACHE")
+    if base:
+        return Path(base)
+    if os.name == "nt":
+        return Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local")) / "catweb-mcp"
+    return Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "catweb-mcp"
+
+
+@dataclass
+class Template:
+    slug: str
+    title: str
+    author: str
+    category: str
+    tags: list[str]
+    type: str
+    source: str
+    description: str
+    folder: Path = field(repr=False)
+
+    def to_summary(self) -> dict:
+        return {
+            "slug": self.slug,
+            "title": self.title,
+            "author": self.author,
+            "category": self.category,
+            "tags": self.tags,
+            "type": self.type,
+            "source": self.source,
+            "description": self.description,
+        }
+
+
+@dataclass
+class Doc:
+    name: str          # e.g. "CatDocs", "JSONScript"
+    filename: str      # e.g. "CatDocs.md"
+    headings: list[str]
+    body: str = field(repr=False)
+    path: Path = field(repr=False)
+
+
+class Index:
+    def __init__(self, docs_repo: str = DEFAULT_DOCS_REPO, resources_repo: str = DEFAULT_RESOURCES_REPO):
+        self.docs_repo = docs_repo
+        self.resources_repo = resources_repo
+        self.root = cache_root()
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.templates: list[Template] = []
+        self.docs: list[Doc] = []
+        self.last_refresh: float = 0.0
+
+    # ---------- fetch ----------
+
+    def _fetch_tarball(self, repo: str, dest: Path) -> None:
+        """Download repo tarball from GitHub and extract into dest (replacing it)."""
+        url = f"https://api.github.com/repos/{repo}/tarball"
+        headers = {"User-Agent": "catweb-mcp"}
+        token = os.environ.get("GITHUB_TOKEN")
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        with httpx.Client(follow_redirects=True, timeout=60) as client:
+            r = client.get(url, headers=headers)
+            r.raise_for_status()
+            data = r.content
+        # Extract to a temp dir, then atomically swap into dest.
+        with tempfile.TemporaryDirectory() as tmp:
+            with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar:
+                tar.extractall(tmp)
+            entries = list(Path(tmp).iterdir())
+            if len(entries) != 1 or not entries[0].is_dir():
+                raise RuntimeError(f"Unexpected tarball layout for {repo}")
+            src = entries[0]
+            if dest.exists():
+                shutil.rmtree(dest)
+            shutil.move(str(src), str(dest))
+
+    def refresh(self, force: bool = False) -> dict:
+        """Fetch both repos if cache is stale (or force=True), then rebuild index."""
+        now = time.time()
+        stale = force or (now - self.last_refresh) > CACHE_TTL_SECONDS or not self._docs_dir().exists() or not self._resources_dir().exists()
+        if stale:
+            self._fetch_tarball(self.docs_repo, self._docs_dir())
+            self._fetch_tarball(self.resources_repo, self._resources_dir())
+            self.last_refresh = now
+        self._build()
+        return {
+            "refreshed": stale,
+            "templates": len(self.templates),
+            "docs": len(self.docs),
+            "cache_age_seconds": int(now - self.last_refresh),
+        }
+
+    def _docs_dir(self) -> Path:
+        return self.root / "catweb-docs"
+
+    def _resources_dir(self) -> Path:
+        return self.root / "catweb-additional-resources"
+
+    # ---------- index ----------
+
+    def _build(self) -> None:
+        self.templates = self._load_templates(self._resources_dir())
+        self.docs = self._load_docs(self._docs_dir())
+
+    def _load_docs(self, root: Path) -> list[Doc]:
+        out: list[Doc] = []
+        for md in sorted(root.glob("*.md")):
+            text = md.read_text(encoding="utf-8", errors="replace")
+            headings = [m.group(1).strip() for m in re.finditer(r"^#{1,6}\s+(.+)$", text, re.MULTILINE)]
+            out.append(Doc(name=md.stem, filename=md.name, headings=headings, body=text, path=md))
+        return out
+
+    def _load_templates(self, root: Path) -> list[Template]:
+        out: list[Template] = []
+        skip_dirs = {"template", "encoder by file.rbx", ".git", ".github", ".claude"}
+        for sub in sorted(root.iterdir()):
+            if not sub.is_dir() or sub.name in skip_dirs:
+                continue
+            info = sub / "info.md"
+            if not info.exists():
+                continue
+            fm, body = self._parse_frontmatter(info.read_text(encoding="utf-8", errors="replace"))
+            if not fm:
+                continue
+            tags = fm.get("tags") or []
+            if isinstance(tags, str):
+                tags = [t.strip() for t in tags.split(",") if t.strip()]
+            out.append(Template(
+                slug=sub.name,
+                title=str(fm.get("title", sub.name)),
+                author=str(fm.get("author", "")),
+                category=str(fm.get("category", "")),
+                tags=[str(t) for t in tags],
+                type=str(fm.get("type", "")),
+                source=str(fm.get("source", "")),
+                description=body.strip(),
+                folder=sub,
+            ))
+        return out
+
+    @staticmethod
+    def _parse_frontmatter(text: str) -> tuple[dict, str]:
+        if not text.startswith("---"):
+            return {}, text
+        end = text.find("\n---", 3)
+        if end < 0:
+            return {}, text
+        try:
+            fm = yaml.safe_load(text[3:end]) or {}
+        except yaml.YAMLError:
+            fm = {}
+        body = text[end + 4 :].lstrip("\n")
+        return fm if isinstance(fm, dict) else {}, body
+
+    # ---------- queries ----------
+
+    def search(self, query: str, kind: str = "all", limit: int = 10) -> list[dict]:
+        q = query.lower().strip()
+        results: list[tuple[int, dict]] = []
+        if kind in ("all", "templates"):
+            for t in self.templates:
+                score = self._score(q, t.title, t.description, " ".join(t.tags), t.author, t.slug)
+                if score > 0:
+                    results.append((score, {"kind": "template", **t.to_summary()}))
+        if kind in ("all", "docs"):
+            for d in self.docs:
+                score = self._score(q, d.name, " ".join(d.headings), d.body[:5000])
+                if score > 0:
+                    results.append((score, {"kind": "doc", "name": d.name, "filename": d.filename, "headings": d.headings[:20]}))
+        results.sort(key=lambda r: r[0], reverse=True)
+        return [r[1] for r in results[:limit]]
+
+    @staticmethod
+    def _score(q: str, *fields: str) -> int:
+        if not q:
+            return 0
+        score = 0
+        terms = [t for t in re.split(r"\s+", q) if t]
+        for f in fields:
+            fl = f.lower()
+            for term in terms:
+                if term in fl:
+                    # exact word match gets higher weight
+                    score += 3 if re.search(rf"\b{re.escape(term)}\b", fl) else 1
+        return score
+
+    def filter_templates(self, tag: str | None = None, author: str | None = None,
+                         type: str | None = None, source: str | None = None,
+                         category: str | None = None, limit: int = 20) -> list[dict]:
+        out: list[dict] = []
+        for t in self.templates:
+            if tag and tag.lower() not in (s.lower() for s in t.tags):
+                continue
+            if author and author.lower() not in t.author.lower():
+                continue
+            if type and type.lower() not in t.type.lower():
+                continue
+            if source and source.lower() not in t.source.lower():
+                continue
+            if category and category.lower() != t.category.lower():
+                continue
+            out.append(t.to_summary())
+            if len(out) >= limit:
+                break
+        return out
+
+    def get_template(self, slug: str) -> dict | None:
+        for t in self.templates:
+            if t.slug == slug:
+                content = (t.folder / "content.md").read_text(encoding="utf-8", errors="replace") if (t.folder / "content.md").exists() else ""
+                credits = (t.folder / "credits.md").read_text(encoding="utf-8", errors="replace") if (t.folder / "credits.md").exists() else ""
+                return {**t.to_summary(), "content": content, "credits": credits}
+        return None
+
+    def get_doc(self, name: str) -> dict | None:
+        target = name.lower().removesuffix(".md")
+        for d in self.docs:
+            if d.name.lower() == target:
+                return {"name": d.name, "filename": d.filename, "headings": d.headings, "content": d.body}
+        return None
+
+    def list_tags(self) -> list[dict]:
+        counts: dict[str, int] = {}
+        for t in self.templates:
+            for tag in t.tags:
+                counts[tag] = counts.get(tag, 0) + 1
+        return [{"tag": k, "count": v} for k, v in sorted(counts.items(), key=lambda kv: -kv[1])]
+
+    def list_authors(self) -> list[dict]:
+        counts: dict[str, int] = {}
+        for t in self.templates:
+            if t.author:
+                counts[t.author] = counts.get(t.author, 0) + 1
+        return [{"author": k, "count": v} for k, v in sorted(counts.items(), key=lambda kv: -kv[1])]
+
+    def stats(self) -> dict:
+        return {
+            "templates": len(self.templates),
+            "docs": [d.name for d in self.docs],
+            "tags": len(self.list_tags()),
+            "authors": len(self.list_authors()),
+            "last_refresh": self.last_refresh,
+            "cache_root": str(self.root),
+        }

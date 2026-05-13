@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+.env
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+.claude/
+
+# Local cache of cloned repos (re-created on startup)
+.cache/
