@@ -97,13 +97,24 @@ def list_authors() -> list[dict]:
 
 
 @mcp.tool()
-def refresh() -> dict:
-    """Force-refresh the cache from GitHub (re-downloads both repos).
+def check_for_updates() -> dict:
+    """Check whether either repo has new commits on GitHub vs. local cache.
 
-    Use this if you suspect the cached data is stale, e.g. after a known
-    repo update. Otherwise the cache auto-refreshes every 24h.
+    Cheap (~200ms, no download). Returns each repo's cached vs latest
+    SHA. Use this before `refresh()` to avoid unnecessary tarball pulls.
     """
-    return index.refresh(force=True)
+    return index.check_for_updates()
+
+
+@mcp.tool()
+def refresh(force: bool = False) -> dict:
+    """Refresh the cache from GitHub.
+
+    By default, only re-downloads repos whose commit SHA on GitHub differs
+    from the cached one (cheap SHA check first). Pass force=True to
+    re-download both unconditionally.
+    """
+    return index.refresh(force=force)
 
 
 @mcp.tool()

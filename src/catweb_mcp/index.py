@@ -76,15 +76,47 @@ class Index:
 
     # ---------- fetch ----------
 
-    def _fetch_tarball(self, repo: str, dest: Path) -> None:
-        """Download repo tarball from GitHub and extract into dest (replacing it)."""
-        url = f"https://api.github.com/repos/{repo}/tarball"
+    def _gh_headers(self) -> dict:
         headers = {"User-Agent": "catweb-mcp"}
         token = os.environ.get("GITHUB_TOKEN")
         if token:
             headers["Authorization"] = f"Bearer {token}"
+        return headers
+
+    def _latest_sha(self, repo: str, branch: str = "main") -> str | None:
+        """Return latest commit SHA on `branch` of `repo`, or None on failure."""
+        url = f"https://api.github.com/repos/{repo}/commits/{branch}"
+        try:
+            with httpx.Client(follow_redirects=True, timeout=15) as client:
+                r = client.get(url, headers={**self._gh_headers(), "Accept": "application/vnd.github.sha"})
+                if r.status_code == 200 and r.text.strip():
+                    return r.text.strip()
+                # fallback: full commit JSON
+                r = client.get(url, headers=self._gh_headers())
+                if r.status_code == 200:
+                    return r.json().get("sha")
+        except httpx.HTTPError:
+            return None
+        return None
+
+    def _meta_path(self) -> Path:
+        return self.root / "meta.json"
+
+    def _load_meta(self) -> dict:
+        p = self._meta_path()
+        if p.exists():
+            try: return json.loads(p.read_text(encoding="utf-8"))
+            except Exception: return {}
+        return {}
+
+    def _save_meta(self, meta: dict) -> None:
+        self._meta_path().write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+    def _fetch_tarball(self, repo: str, dest: Path) -> None:
+        """Download repo tarball from GitHub and extract into dest (replacing it)."""
+        url = f"https://api.github.com/repos/{repo}/tarball"
         with httpx.Client(follow_redirects=True, timeout=60) as client:
-            r = client.get(url, headers=headers)
+            r = client.get(url, headers=self._gh_headers())
             r.raise_for_status()
             data = r.content
         # Extract to a temp dir, then atomically swap into dest.
@@ -99,20 +131,54 @@ class Index:
                 shutil.rmtree(dest)
             shutil.move(str(src), str(dest))
 
+    def check_for_updates(self) -> dict:
+        """Compare cached commit SHAs against GitHub. Cheap (~200ms, no download).
+
+        Returns each repo's cached SHA, latest SHA, and whether they differ.
+        """
+        meta = self._load_meta()
+        out: dict = {}
+        for key, repo in (("docs", self.docs_repo), ("resources", self.resources_repo)):
+            cached = (meta.get(key) or {}).get("sha")
+            latest = self._latest_sha(repo)
+            out[key] = {
+                "repo": repo,
+                "cached_sha": cached,
+                "latest_sha": latest,
+                "up_to_date": bool(cached) and cached == latest,
+            }
+        out["any_outdated"] = any(not r["up_to_date"] for r in out.values() if isinstance(r, dict))
+        return out
+
     def refresh(self, force: bool = False) -> dict:
-        """Fetch both repos if cache is stale (or force=True), then rebuild index."""
-        now = time.time()
-        stale = force or (now - self.last_refresh) > CACHE_TTL_SECONDS or not self._docs_dir().exists() or not self._resources_dir().exists()
-        if stale:
-            self._fetch_tarball(self.docs_repo, self._docs_dir())
-            self._fetch_tarball(self.resources_repo, self._resources_dir())
-            self.last_refresh = now
+        """Re-fetch repos if their commit SHA on GitHub differs from cached (or force=True).
+
+        Without force, this only re-downloads repos that actually changed —
+        the SHA check is ~200ms and avoids a multi-megabyte tarball pull
+        when nothing has moved.
+        """
+        meta = self._load_meta()
+        updated: dict[str, dict] = {}
+        for key, repo, dest in (
+            ("docs", self.docs_repo, self._docs_dir()),
+            ("resources", self.resources_repo, self._resources_dir()),
+        ):
+            cached_sha = (meta.get(key) or {}).get("sha")
+            latest_sha = self._latest_sha(repo)
+            needs_download = force or not dest.exists() or not cached_sha or (latest_sha and cached_sha != latest_sha)
+            if needs_download:
+                self._fetch_tarball(repo, dest)
+                meta[key] = {"sha": latest_sha, "fetched_at": time.time(), "repo": repo}
+                updated[key] = {"changed": True, "from": cached_sha, "to": latest_sha}
+            else:
+                updated[key] = {"changed": False, "sha": cached_sha}
+        self._save_meta(meta)
+        self.last_refresh = time.time()
         self._build()
         return {
-            "refreshed": stale,
             "templates": len(self.templates),
             "docs": len(self.docs),
-            "cache_age_seconds": int(now - self.last_refresh),
+            "repos": updated,
         }
 
     def _docs_dir(self) -> Path:
