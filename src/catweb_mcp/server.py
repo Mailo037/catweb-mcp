@@ -6,7 +6,9 @@ from mcp.server.fastmcp import FastMCP
 
 from .index import Index, DEFAULT_DOCS_REPO, DEFAULT_RESOURCES_REPO
 
-mcp = FastMCP("catweb-mcp")
+_host = os.environ.get("CATWEB_MCP_HOST", "127.0.0.1")
+_port = int(os.environ.get("CATWEB_MCP_PORT", "8000"))
+mcp = FastMCP("catweb-mcp", host=_host, port=_port)
 
 docs_repo = os.environ.get("CATWEB_DOCS_REPO", DEFAULT_DOCS_REPO)
 resources_repo = os.environ.get("CATWEB_RESOURCES_REPO", DEFAULT_RESOURCES_REPO)
@@ -125,7 +127,10 @@ def stats() -> dict:
 
 
 def main() -> None:
-    mcp.run()
+    # FASTMCP_HOST / FASTMCP_PORT env vars control host:port when using HTTP transports.
+    # CATWEB_MCP_TRANSPORT selects "stdio" (default), "sse", or "streamable-http".
+    transport = os.environ.get("CATWEB_MCP_TRANSPORT", "stdio")
+    mcp.run(transport=transport)
 
 
 if __name__ == "__main__":

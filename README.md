@@ -21,6 +21,52 @@ The server downloads tarballs of both repos on startup (one HTTP call each, ~1�
 | `refresh(force=False)` | Re-download repos whose SHA changed (or all if `force=True`) |
 | `stats()` | Index stats and cache info |
 
+## Hosted public server
+
+A publicly hosted instance is available — no installation needed:
+
+```
+https://catweb-mcp.next-aether.cloud/sse
+```
+
+Open access, no auth required. The server only reads public GitHub tarballs.
+
+### Use in Claude Code
+
+```bash
+claude mcp add --transport sse catweb https://catweb-mcp.next-aether.cloud/sse
+```
+
+Or add manually to `~/.claude/settings.json`:
+
+```json
+{
+  "mcpServers": {
+    "catweb": {
+      "type": "sse",
+      "url": "https://catweb-mcp.next-aether.cloud/sse"
+    }
+  }
+}
+```
+
+### Use in Claude Desktop
+
+`%APPDATA%\Claude\claude_desktop_config.json` (Windows) or `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS):
+
+```json
+{
+  "mcpServers": {
+    "catweb": {
+      "type": "sse",
+      "url": "https://catweb-mcp.next-aether.cloud/sse"
+    }
+  }
+}
+```
+
+---
+
 ## Install
 
 ```bash
@@ -80,6 +126,28 @@ claude mcp add catweb catweb-mcp
 | `CATWEB_RESOURCES_REPO` | `Mailo037/catweb-additional-resources` | override resources repo |
 | `CATWEB_MCP_CACHE` | `%LOCALAPPDATA%\catweb-mcp` / `~/.cache/catweb-mcp` | cache directory |
 | `GITHUB_TOKEN` | (unset) | raises GitHub rate limit from 60/hr to 5000/hr |
+| `CATWEB_MCP_TRANSPORT` | `stdio` | set to `sse` or `streamable-http` for HTTP mode |
+| `CATWEB_MCP_HOST` | `127.0.0.1` | bind address for HTTP transports |
+| `CATWEB_MCP_PORT` | `8000` | port for HTTP transports |
+
+## Self-hosting
+
+```bash
+git clone https://github.com/Mailo037/catweb-mcp
+cd catweb-mcp
+
+# Set transport and bind address
+export CATWEB_MCP_TRANSPORT=sse
+export CATWEB_MCP_HOST=0.0.0.0
+export CATWEB_MCP_PORT=8080
+
+pip install .
+catweb-mcp
+# → Uvicorn running on http://0.0.0.0:8080
+# SSE endpoint: http://<your-host>:8080/sse
+```
+
+Or with Docker (includes a ready-made `docker-compose.yml` for Traefik + Let's Encrypt).
 
 ## Example queries
 
