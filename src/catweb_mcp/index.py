@@ -190,7 +190,7 @@ class Index:
     # ---------- index ----------
 
     def _build(self) -> None:
-        self.templates = self._load_templates(self._resources_dir())
+        self.templates = self._load_templates(self._resources_dir() / "library")
         self.docs = self._load_docs(self._docs_dir())
 
     def _load_docs(self, root: Path) -> list[Doc]:
